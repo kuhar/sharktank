@@ -59,6 +59,26 @@ def test_parse_tensor_type():
     ) == candidate_gen.ShapedType([123], candidate_gen.ElementType.i8)
 
 
+def test_tile_sizes_to_str():
+    assert str(candidate_gen.TileSizes([], [])) == "reduction = [], workgroup = []"
+    assert str(candidate_gen.TileSizes([1], [2])) == "reduction = [1], workgroup = [2]"
+    assert str(candidate_gen.TileSizes([1, 2], [3, 4])) == "reduction = [1, 2], workgroup = [3, 4]"
+
+
+def test_parse_tile_sizes():
+    empty_lowering_config = "lowering_config = #iree_gpu.lowering_config<{reduction = [], workgroup = []}>"
+    parsed = candidate_gen.parse_lowering_config(empty_lowering_config)
+    assert parsed.reduction == []
+    assert parsed.workgroup == []
+    assert parsed.dimension_map is None
+
+    lowering_config = "lowering_config = #iree_gpu.lowering_config<{reduction = [0, 0, 32], workgroup = [64, 128, 0]}>"
+    parsed = candidate_gen.parse_lowering_config(lowering_config)
+    assert parsed.reduction == [0, 0, 32]
+    assert parsed.workgroup == [64, 128, 0]
+    assert parsed.dimension_map is None
+
+
 def test_get_mmt_tile_sizes():
     config = candidate_gen.Configuration(
         subgroup_size=0,

@@ -26,15 +26,13 @@ import re
 import z3
 from dataclasses import astuple, dataclass
 from enum import Enum
-from os import mkdir, path, makedirs
+from os import path, makedirs
 from typing import Optional
 from textwrap import indent
 from abc import ABC, abstractmethod
 
 import iree.compiler as ireec
 from iree.compiler import ir
-from iree.compiler.dialects import _linalg_ops_gen, _util_ops_gen
-
 
 tune_logger = logging.getLogger("tune")
 
@@ -187,11 +185,24 @@ class GpuPipelineOptions:
 
 
 @dataclass
+class TileSizes:
+    reduction: list[int]
+    workgroup: list[int]
+    # Maps tile size dims to problem size dims, e.g., 'mnk' for a standard mmt dispatch.
+    dimension_map: Optional[str] = None
+
+    def __str__(self) -> str:
+        reduction_str = f"reduction = [{', '.join(map(str, self.reduction))}]"
+        workgroup_str = f"workgroup = [{', '.join(map(str, self.workgroup))}]"
+        return f"{reduction_str}, {workgroup_str}"
+
+
+@dataclass
 class Configuration:
     subgroup_size: int
     workgroup_size: list[int]
     intrinsic: MfmaIntrinsic
-    tile_sizes: list[int]
+    tile_sizes: TileSizes
     subgroup_m_count: int
     subgroup_n_count: int
     gpu_pipeline_options: GpuPipelineOptions
@@ -593,6 +604,23 @@ class DispatchTunerRegistry:
         assert False, "Dispatch kind not supported"
 
 
+def parse_lowering_config(mlir_line: str) -> TileSizes:
+    assert '#iree_gpu.lowering_config<' in mlir_line
+    array_re = r"\[([0-9,\s]*)\]"
+    lowering_config_re = rf"#iree_gpu\.lowering_config<{{reduction\s*=\s*{array_re},\s*workgroup\s*=\s*{array_re}}}>"
+    config_match = re.search(lowering_config_re, mlir_line)
+    assert config_match is not None, "Unexpected syntax"
+
+    def to_int_list(str_list: str) -> list[int]:
+        if len(str_list.strip()) == 0:
+            return []
+        return list(map(lambda x: int(x.strip()), str_list.split(',')))
+
+    reduction_sizes = to_int_list(config_match.group(1))
+    workgroup_sizes = to_int_list(config_match.group(2))
+    return TileSizes(reduction=reduction_sizes, workgroup=workgroup_sizes)
+
+
 class MmtTuner(DispatchTuner):
     def supports(self, op_name: str) -> bool:
         return "matmul_transpose_b" in op_name
@@ -650,8 +678,6 @@ class MmtTuner(DispatchTuner):
     def get_transform_function_mmt(
         self, problem_size: ProblemSize, functionName: str, configuration: Configuration
     ) -> str:
-        tile_sizes = ", ".join(map(str, get_mmt_tile_sizes(configuration)))
-
         wg_x, wg_y, wg_z = configuration.workgroup_size
         extra_config = get_pipeline_config(configuration)
 
@@ -663,7 +689,7 @@ class MmtTuner(DispatchTuner):
     transform.iree.match.cast_compatible_type %lhs = tensor<{problem_size.lhs_type}> : !transform.any_value
     transform.iree.match.cast_compatible_type %rhs = tensor<{problem_size.rhs_type}> : !transform.any_value
     %config = transform.param.constant #iree_codegen.compilation_info<
-        lowering_config = #iree_codegen.lowering_config<tile_sizes = [[{tile_sizes}]]>,
+        lowering_config = #iree_codegen.lowering_config<{configuration.tile_sizes}>,
         translation_info = #iree_codegen.translation_info<LLVMGPUVectorDistribute
         workgroup_size = [{wg_x}, {wg_y}, {wg_z}] subgroup_size = {configuration.subgroup_size},
         {{mma_schedule = #iree_gpu.mma_schedule<
