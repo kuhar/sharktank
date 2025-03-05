@@ -40,6 +40,7 @@ def filter_by_model(filenames, model):
 def get_mlir_filenames(model_params: ModelParams, model=None):
     mlir_filenames = []
     file_stems = get_file_stems(model_params)
+    print(file_stems)
     for stem in file_stems:
         mlir_filenames.extend([stem + ".mlir"])
     return filter_by_model(mlir_filenames, model)
@@ -69,7 +70,7 @@ def get_params_filenames(model_params: ModelParams, model=None, splat: bool = Fa
     ]
     if model_params.use_i8_punet:
         modnames.append("punet")
-        mod_precs.append("i8")
+        mod_precs.append("fp8_ocp")
     else:
         modnames.append("unet")
         mod_precs.append(dtype_to_filetag[model_params.unet_dtype])
