@@ -4,12 +4,13 @@
 # See https://llvm.org/LICENSE.txt for license information.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-from typing import Optional
+from typing import Iterator
 from abc import abstractmethod
 
 from iree.compiler import ir  # type: ignore
+from iree.compiler.dialects import iree_gpu  # type: ignore
 
-from . import common, constraint_generator, dispatch_parser
+from . import common, dispatch_parser
 
 
 class DispatchTuner(dispatch_parser.DispatchParser):
@@ -34,23 +35,17 @@ class DispatchTuner(dispatch_parser.DispatchParser):
         pass
 
     @abstractmethod
-    def get_constraint_generator(self) -> constraint_generator.ConstraintGenerator:
-        """Returns a ConstraintGenerator associated with this dispatch root op."""
+    def generate_solutions(
+        self,
+        tuner_context: common.TunerContext,
+        gpu_target_info: iree_gpu.TargetInfo,
+        **pipeline_constraint_options,
+    ) -> Iterator[list[common.TuningConfiguration]]:
+        """Generate a sequence of tuning configuration entries."""
         pass
 
     @classmethod
     @abstractmethod
     def get_dispatch_kind(cls) -> common.DispatchKind:
         """Returns dispatch kind"""
-        pass
-
-    @abstractmethod
-    def get_knob_assignment(
-        self,
-        config_list: list[common.TuningConfiguration],
-    ) -> Optional[common.KnobAssignment]:
-        """
-        Return a KnobAssignment that records the feature values of a single candidate,
-        retrieved from the `knob_assignment` attribute of its TuningConfiguration.
-        """
         pass

@@ -5,13 +5,13 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 import logging
-from typing import Optional
+from typing import Iterator
 
 from iree.compiler import ir  # type: ignore
-from iree.compiler.dialects import iree_codegen, linalg  # type: ignore
+from iree.compiler.dialects import iree_codegen, iree_gpu, linalg  # type: ignore
 
-from .. import common, constraint_generator, dispatch_parser, spec_builder, tuner_base
-from . import rocm_constraint_generators, rocm_parsers
+from .. import common, dispatch_parser, spec_builder, tuner_base
+from . import rocm_compiler_constraints, rocm_parsers
 
 
 class ROCmContractionVectorDistributeTuner(
@@ -41,9 +41,23 @@ class ROCmContractionVectorDistributeTuner(
 
         return True
 
-    def get_constraint_generator(self) -> constraint_generator.ConstraintGenerator:
-        return rocm_constraint_generators.ROCmContractionVectorDistributeConstraintGenerator(
-            self.get_op_info()
+    def generate_solutions(
+        self,
+        tuner_context: common.TunerContext,
+        gpu_target_info: iree_gpu.TargetInfo,
+        **pipeline_constraint_options,
+    ) -> Iterator[list[common.TuningConfiguration]]:
+        op_info = self.get_op_info()
+        return rocm_compiler_constraints.generate_compiler_contraction_solutions(
+            tuner_ctx=tuner_context,
+            gpu_target_info=gpu_target_info,
+            contraction_dims=op_info.dims,
+            matmul_size=op_info.matmul_size,
+            lhs_type=op_info.lhs_type,
+            rhs_type=op_info.rhs_type,
+            res_type=op_info.res_type,
+            pipeline_filter=iree_codegen.DispatchLoweringPassPipeline.LLVMGPUVectorDistribute,
+            **pipeline_constraint_options,
         )
 
     def get_td_spec(
@@ -56,12 +70,6 @@ class ROCmContractionVectorDistributeTuner(
     @classmethod
     def get_dispatch_kind(cls) -> common.DispatchKind:
         return common.DispatchKind.contraction
-
-    def get_knob_assignment(
-        self,
-        config_list: list[common.TuningConfiguration],
-    ) -> Optional[common.KnobAssignment]:
-        return config_list[0].knob_assignment
 
 
 class ROCmContractionTileAndFuseTuner(
@@ -91,9 +99,23 @@ class ROCmContractionTileAndFuseTuner(
 
         return True
 
-    def get_constraint_generator(self) -> constraint_generator.ConstraintGenerator:
-        return rocm_constraint_generators.ROCmContractionTileAndFuseConstraintGenerator(
-            self.get_op_info()
+    def generate_solutions(
+        self,
+        tuner_context: common.TunerContext,
+        gpu_target_info: iree_gpu.TargetInfo,
+        **pipeline_constraint_options,
+    ) -> Iterator[list[common.TuningConfiguration]]:
+        op_info = self.get_op_info()
+        return rocm_compiler_constraints.generate_compiler_contraction_solutions(
+            tuner_ctx=tuner_context,
+            gpu_target_info=gpu_target_info,
+            contraction_dims=op_info.dims,
+            matmul_size=op_info.matmul_size,
+            lhs_type=op_info.lhs_type,
+            rhs_type=op_info.rhs_type,
+            res_type=op_info.res_type,
+            pipeline_filter=iree_codegen.DispatchLoweringPassPipeline.LLVMGPUTileAndFuse,
+            **pipeline_constraint_options,
         )
 
     def get_td_spec(
@@ -106,12 +128,6 @@ class ROCmContractionTileAndFuseTuner(
     @classmethod
     def get_dispatch_kind(cls) -> common.DispatchKind:
         return common.DispatchKind.contraction
-
-    def get_knob_assignment(
-        self,
-        config_list: list[common.TuningConfiguration],
-    ) -> Optional[common.KnobAssignment]:
-        return config_list[0].knob_assignment
 
 
 class ROCmConvolutionVectorDistributeTuner(
@@ -137,9 +153,48 @@ class ROCmConvolutionVectorDistributeTuner(
             and list(convolution_dims.depth) == []
         )
 
-    def get_constraint_generator(self) -> constraint_generator.ConstraintGenerator:
-        return rocm_constraint_generators.ROCmConvolutionVectorDistributeConstraintGenerator(
-            self.get_op_info()
+    def generate_solutions(
+        self,
+        tuner_context: common.TunerContext,
+        gpu_target_info: iree_gpu.TargetInfo,
+        **pipeline_constraint_options,
+    ) -> Iterator[list[common.TuningConfiguration]]:
+        op_info = self.get_op_info()
+        return rocm_compiler_constraints.generate_compiler_contraction_solutions(
+            tuner_ctx=tuner_context,
+            gpu_target_info=gpu_target_info,
+            contraction_dims=op_info.dims,
+            matmul_size=op_info.matmul_size,
+            lhs_type=op_info.lhs_type,
+            rhs_type=op_info.rhs_type,
+            res_type=op_info.res_type,
+            module_str_builder=self._build_conv_mlir,
+            pipeline_filter=iree_codegen.DispatchLoweringPassPipeline.LLVMGPUVectorDistribute,
+            **pipeline_constraint_options,
+        )
+
+    def _build_conv_mlir(
+        self, gpu_target_info: iree_gpu.TargetInfo
+    ) -> str:
+        """Build conv MLIR from the op_info shapes."""
+        info = self.get_op_info()
+        input_shape = info.lhs_type.shape  # [batch, ih, iw, ic]
+        filter_shape = info.rhs_type.shape  # [fh, fw, ic, oc]
+        output_shape = info.res_type.shape  # [batch, oh, ow, oc]
+        return rocm_compiler_constraints.build_hal_executable_conv_mlir_str(
+            batch=output_shape[0],
+            oh=output_shape[1],
+            ow=output_shape[2],
+            oc=output_shape[3],
+            ih=input_shape[1],
+            iw=input_shape[2],
+            ic=input_shape[3],
+            fh=filter_shape[0],
+            fw=filter_shape[1],
+            input_elem=str(info.lhs_type.element_type),
+            filter_elem=str(info.rhs_type.element_type),
+            res_elem=str(info.res_type.element_type),
+            gpu_target_info=gpu_target_info,
         )
 
     def get_td_spec(
@@ -152,12 +207,6 @@ class ROCmConvolutionVectorDistributeTuner(
     @classmethod
     def get_dispatch_kind(cls) -> common.DispatchKind:
         return common.DispatchKind.conv
-
-    def get_knob_assignment(
-        self,
-        config_list: list[common.TuningConfiguration],
-    ) -> Optional[common.KnobAssignment]:
-        return None
 
 
 class ROCmConvolutionTileAndFuseTuner(
@@ -176,9 +225,48 @@ class ROCmConvolutionTileAndFuseTuner(
         # Support all 2D convolutions (no depth dimension) for IGEMM.
         return list(convolution_dims.depth) == []
 
-    def get_constraint_generator(self) -> constraint_generator.ConstraintGenerator:
-        return rocm_constraint_generators.ROCmConvolutionTileAndFuseConstraintGenerator(
-            self.get_op_info()
+    def generate_solutions(
+        self,
+        tuner_context: common.TunerContext,
+        gpu_target_info: iree_gpu.TargetInfo,
+        **pipeline_constraint_options,
+    ) -> Iterator[list[common.TuningConfiguration]]:
+        op_info = self.get_op_info()
+        return rocm_compiler_constraints.generate_compiler_contraction_solutions(
+            tuner_ctx=tuner_context,
+            gpu_target_info=gpu_target_info,
+            contraction_dims=op_info.dims,
+            matmul_size=op_info.matmul_size,
+            lhs_type=op_info.lhs_type,
+            rhs_type=op_info.rhs_type,
+            res_type=op_info.res_type,
+            module_str_builder=self._build_conv_mlir,
+            pipeline_filter=iree_codegen.DispatchLoweringPassPipeline.LLVMGPUTileAndFuse,
+            **pipeline_constraint_options,
+        )
+
+    def _build_conv_mlir(
+        self, gpu_target_info: iree_gpu.TargetInfo
+    ) -> str:
+        """Build conv MLIR from the op_info shapes."""
+        info = self.get_op_info()
+        input_shape = info.lhs_type.shape  # [batch, ih, iw, ic]
+        filter_shape = info.rhs_type.shape  # [fh, fw, ic, oc]
+        output_shape = info.res_type.shape  # [batch, oh, ow, oc]
+        return rocm_compiler_constraints.build_hal_executable_conv_mlir_str(
+            batch=output_shape[0],
+            oh=output_shape[1],
+            ow=output_shape[2],
+            oc=output_shape[3],
+            ih=input_shape[1],
+            iw=input_shape[2],
+            ic=input_shape[3],
+            fh=filter_shape[0],
+            fw=filter_shape[1],
+            input_elem=str(info.lhs_type.element_type),
+            filter_elem=str(info.rhs_type.element_type),
+            res_elem=str(info.res_type.element_type),
+            gpu_target_info=gpu_target_info,
         )
 
     def get_td_spec(
@@ -192,12 +280,6 @@ class ROCmConvolutionTileAndFuseTuner(
     def get_dispatch_kind(cls) -> common.DispatchKind:
         return common.DispatchKind.conv
 
-    def get_knob_assignment(
-        self,
-        config_list: list[common.TuningConfiguration],
-    ) -> Optional[common.KnobAssignment]:
-        return None
-
 
 class ROCmAttentionVectorDistributeTuner(
     tuner_base.DispatchTuner, dispatch_parser.AttentionOpInterfaceParser
@@ -209,11 +291,17 @@ class ROCmAttentionVectorDistributeTuner(
     def supports_root_op(cls, root_op: ir.Operation) -> bool:
         return iree_codegen.isa_attention_op(root_op)
 
-    def get_constraint_generator(self) -> constraint_generator.ConstraintGenerator:
-        return (
-            rocm_constraint_generators.ROCmAttentionVectorDistributeConstraintGenerator(
-                self.get_op_info()
-            )
+    def generate_solutions(
+        self,
+        tuner_context: common.TunerContext,
+        gpu_target_info: iree_gpu.TargetInfo,
+        **pipeline_constraint_options,
+    ) -> Iterator[list[common.TuningConfiguration]]:
+        return rocm_compiler_constraints.generate_compiler_attention_solutions(
+            tuner_ctx=tuner_context,
+            gpu_target_info=gpu_target_info,
+            op_info=self.get_op_info(),
+            **pipeline_constraint_options,
         )
 
     def get_td_spec(
@@ -226,12 +314,6 @@ class ROCmAttentionVectorDistributeTuner(
     @classmethod
     def get_dispatch_kind(cls) -> common.DispatchKind:
         return common.DispatchKind.attention
-
-    def get_knob_assignment(
-        self,
-        config_list: list[common.TuningConfiguration],
-    ) -> Optional[common.KnobAssignment]:
-        return None
 
 
 def get_tuners_for_pipeline(

@@ -42,38 +42,6 @@ class ConvToIgemmInfo:
     input_channel_dim_to_size: dict[int, int] = field(default_factory=dict)
 
 
-@dataclass
-class LLVMGPUContractionKnobs(common.KnobAssignment):
-    # Problem Size.
-    M: int
-    N: int
-    K: int
-
-    # Z3 numeric selections.
-    tile_m: int
-    tile_n: int
-    tile_k: int
-    wg_x: int
-    wg_y: int
-    wg_z: int
-    subgroup_m_cnt: int
-    subgroup_n_cnt: int
-    intrinsic_mn: int
-    intrinsic_k: int
-    subgroup_m: int
-    subgroup_n: int
-
-
-@dataclass
-class ConvolutionKnobs(common.KnobAssignment):
-    pass
-
-
-@dataclass
-class AttentionKnobs(common.KnobAssignment):
-    pass
-
-
 def get_compatible_mma_intrinsics(
     lhs_type: common.ShapedType,
     rhs_type: common.ShapedType,
@@ -334,6 +302,34 @@ class RocProfBenchmarkResult:
     candidate_id: int
     time: float
     device_id: str
+
+
+@dataclass
+class PipelineOptionsSearchSpace:
+    prefetch_num_stages: list[Optional[int]] = field(default_factory=lambda: [None])
+    no_reduce_shared_memory_bank_conflicts: list[Optional[bool]] = field(
+        default_factory=lambda: [None]
+    )
+    use_igemm_convolution: list[Optional[bool]] = field(default_factory=lambda: [None])
+
+
+def generate_allowed_pipeline_options(
+    pipeline_options_search_space: PipelineOptionsSearchSpace,
+) -> list[iree_gpu.PipelineOptionsAttr]:
+    pipeline_options_list = []
+    for pns in pipeline_options_search_space.prefetch_num_stages:
+        for (
+            nrbc
+        ) in pipeline_options_search_space.no_reduce_shared_memory_bank_conflicts:
+            for igemm in pipeline_options_search_space.use_igemm_convolution:
+                pipeline_options_list.append(
+                    iree_gpu.PipelineOptionsAttr.get(
+                        pns,
+                        nrbc,
+                        igemm,
+                    )
+                )
+    return pipeline_options_list
 
 
 def run_rocprof_command(benchmark_pack: Any) -> RocProfBenchmarkResult:

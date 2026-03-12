@@ -20,7 +20,7 @@ from . import (
     process_utils,
     spec_builder,
 )
-from .rocm import rocm_common, rocm_dispatch_constraints, rocm_tuners
+from .rocm import rocm_common, rocm_tuners
 from .tuner_base import DispatchTuner
 
 tune_logger = logging.getLogger("tune")
@@ -94,15 +94,13 @@ def generate_solutions(
     tuner_context: common.TunerContext,
     num_subgroups: int = 4,  # GPU spec, used to determine candidate generation constraints.
     allowed_waves_per_eu: list[int] = [2],
-    pipeline_options_search_space: rocm_dispatch_constraints.PipelineOptionsSearchSpace = rocm_dispatch_constraints.PipelineOptionsSearchSpace(),
+    pipeline_options_search_space: rocm_common.PipelineOptionsSearchSpace = rocm_common.PipelineOptionsSearchSpace(),
     codegen_pipeline: iree_codegen.DispatchLoweringPassPipeline = iree_codegen.DispatchLoweringPassPipeline.LLVMGPUVectorDistribute,
 ) -> Iterator[list[common.TuningConfiguration]]:
     if target_info.arch not in rocm_common.ROCM_ARCHITECTURES:
         print(f"Warning: Untested architecture '{target_info.arch}'.")
 
-    constraint_generator = dispatch_tuner.get_constraint_generator()
-
-    return constraint_generator.generate_solutions(
+    return dispatch_tuner.generate_solutions(
         tuner_context,
         target_info,
         num_subgroups=num_subgroups,

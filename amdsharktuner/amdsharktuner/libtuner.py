@@ -46,7 +46,7 @@ from . import (
     dispatch_parser,
     process_utils,
 )
-from .rocm import rocm_candidate_ordering, rocm_common, rocm_dispatch_constraints
+from .rocm import rocm_common
 
 
 # Default random seed.
@@ -73,7 +73,6 @@ class CandidateTracker:
     compiled_vmfb_path: Optional[Path] = None
     spec_path: Optional[Path] = None
     td_spec_str: Optional[str] = None
-    knob_assignment: Optional[common.KnobAssignment] = None
     kernel_trace_path: Optional[Path] = None
 
 
@@ -759,7 +758,7 @@ def generate_candidate_specs(
         mlir_text = candidate_gen.strip_compilation_info(path_config.template_mlir)
         mlir_module = dispatch_parser.parse_mlir(mlir_text, tuning_client.tuner_context)
         logging.debug("Captured messages from candidate_gen.py:")
-        pipeline_options_search_space = rocm_dispatch_constraints.PipelineOptionsSearchSpace(
+        pipeline_options_search_space = rocm_common.PipelineOptionsSearchSpace(
             prefetch_num_stages=args.prefetch_num_stages_options,
             no_reduce_shared_memory_bank_conflicts=args.no_reduce_shared_memory_bank_conflicts_options,
         )
@@ -770,11 +769,6 @@ def generate_candidate_specs(
 
         tuning_client.target_info = common.get_target_info(mlir_module)
         assert tuning_client.target_info, "Failed to query target info."
-        if args.candidate_order == candidate_ordering.CandidateOrderKind.heuristic:
-            assert tuning_client.target_info.workgroup_count != 0, (
-                "Failed to retrieve the number of CUs required for the candidate reordering heuristic. "
-                "Try compiling with the GPU SKU specified in the flags (e.g., --iree-rocm-target=mi300x)."
-            )
 
         dispatch_tuners = candidate_gen.get_supported_dispatch_tuners(
             tuning_client.target_info.arch,
@@ -811,15 +805,9 @@ def generate_candidate_specs(
         logging.debug(f"Completed candidate generation in {elapsed_time:.6f}s\n")
         logging.debug(f"Max search space size: {len(solutions)}")
 
-        knobs: list[Optional[common.KnobAssignment]] = [
-            dispatch_tuner.get_knob_assignment(s) for s in solutions
-        ]
-
-        sorted_order = candidate_ordering.reorder_assignments(
-            knobs=knobs,
+        sorted_order = candidate_ordering.reorder_candidates(
+            count=len(solutions),
             strategy=args.candidate_order,
-            target_info=tuning_client.target_info,
-            sort_key_map=rocm_candidate_ordering.ROCM_SORT_KEY_MAP,
         )
         solutions = [solutions[i] for i in sorted_order] if sorted_order else solutions
         solutions = solutions[: args.num_candidates]
@@ -834,14 +822,9 @@ def generate_candidate_specs(
         assert len(config_specs) == len(solutions) + 1
 
         tuning_client.tuning_records = (
-            candidate_ordering.build_tuning_records_from_order(knobs, sorted_order)
+            candidate_ordering.build_tuning_records_from_order(sorted_order)
         )
 
-        # Prepend None for the baseline config (no knob assignment) at index 0.
-        knob_assignments = [None] + [
-            dispatch_tuner.get_knob_assignment(s) for s in solutions
-        ]
-        assert len(config_specs) == len(knob_assignments)
         logging.debug("candidate_gen.py ends")
         handle_error(
             condition=(len(solutions) <= 1), msg="Failed to generate any candidates"
@@ -849,9 +832,7 @@ def generate_candidate_specs(
 
         # Create candidate trackers.
         candidates = []
-        for candidate_num, (spec, knob) in enumerate(
-            zip(config_specs, knob_assignments)
-        ):
+        for candidate_num, spec in enumerate(config_specs):
             candidates.append(candidate_num)
             # Move the specs to the canonical path_config location.
             spec_path = path_config.specs_dir / path_config.get_candidate_spec_filename(
@@ -885,7 +866,6 @@ def generate_candidate_specs(
                 candidate_id=candidate_num,
                 spec_path=spec_path,
                 td_spec_str=td_spec_str,
-                knob_assignment=knob,
             )
             tuning_client.candidate_trackers.append(new_candidate)
     except Exception as e:

@@ -6,11 +6,10 @@
 
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from enum import Enum
 from types import TracebackType
 from typing import Optional, Any, Callable, Protocol
-from abc import ABC
 import os
 import time
 import z3  # type: ignore
@@ -129,15 +128,6 @@ class TimeBudget:
 
 
 @dataclass
-class KnobAssignment(ABC):
-    """A KnobAssignment is a record of tuning parameters values from constraint_generator"""
-
-    def get_knobs(self) -> dict:
-        """Return a dict of all knob parameters and their assigned values."""
-        return asdict(self)
-
-
-@dataclass
 class TuningConfiguration:
     """
     A TuningConfiguration contains an attribute that will be set on an op as a
@@ -151,7 +141,6 @@ class TuningConfiguration:
 
     name: str
     configuration: ir.Attribute
-    knob_assignment: Optional[KnobAssignment] = None
 
 
 class DispatchKind(Enum):
