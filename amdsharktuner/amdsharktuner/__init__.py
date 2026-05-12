@@ -9,9 +9,11 @@ from iree.compiler import ir  # type: ignore
 
 # Substitute `replace=True` so that colliding registration don't error.
 # TODO(makslevental): remove after https://github.com/llvm/llvm-project/pull/117918 is resolved.
-def register_attribute_builder(kind, replace=True):
+def register_attribute_builder(kind, replace=True, allow_existing=False):
     def decorator_builder(func):
-        ir.AttrBuilder.insert(kind, func, replace=replace)
+        ir.AttrBuilder.insert(
+            kind, func, replace=replace, allow_existing=allow_existing
+        )
         return func
 
     return decorator_builder

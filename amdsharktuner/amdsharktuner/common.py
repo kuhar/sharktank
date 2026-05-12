@@ -22,6 +22,30 @@ import iree.compiler as ireec  # type: ignore
 from iree.compiler._mlir_libs._mlir import ir  # type: ignore
 
 
+def _install_codegen_pipeline_compat():
+    """Provide the old pipeline binding names on newer IREE builds."""
+    if hasattr(iree_codegen, "DispatchLoweringPassPipeline"):
+        return
+
+    class _DispatchLoweringPassPipeline:
+        LLVMGPUVectorDistribute = iree_gpu.LoweringPipeline.VectorDistribute
+        LLVMGPUTileAndFuse = iree_gpu.LoweringPipeline.TileAndFuse
+
+    class _DispatchLoweringPassPipelineAttr:
+        def __new__(cls, attr):
+            return iree_gpu.PipelineAttr(attr)
+
+        @staticmethod
+        def get(value):
+            return iree_gpu.PipelineAttr.get(int(value))
+
+    iree_codegen.DispatchLoweringPassPipeline = _DispatchLoweringPassPipeline
+    iree_codegen.DispatchLoweringPassPipelineAttr = _DispatchLoweringPassPipelineAttr
+
+
+_install_codegen_pipeline_compat()
+
+
 class CommonTypes:
     def __init__(self, ctx: ir.Context):
         assert ctx

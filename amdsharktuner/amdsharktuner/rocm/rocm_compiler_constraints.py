@@ -335,8 +335,8 @@ def run_insert_smt_constraints(
 
     cmd = [
         iree_opt_path,
-        "--iree-config-add-tuner-attributes",
-        "--pass-pipeline=builtin.module(hal.executable(hal.executable.variant(builtin.module(iree-codegen-insert-smt-constraints))))",
+        "--iree-codegen-add-tuner-attributes",
+        "--pass-pipeline=builtin.module(hal.executable(hal.executable.variant(builtin.module(iree-llvmgpu-select-lowering-strategy,func.func(iree-codegen-insert-smt-constraints)))))",
     ]
     result = subprocess.run(
         cmd,
@@ -356,7 +356,7 @@ def _make_module_parseable(module_str: str) -> str:
     """
     Preprocess the output from iree-opt to replace unparseable attributes.
 
-    DispatchLoweringPassPipelineAttr has empty mnemonic and can't be
+    Older DispatchLoweringPassPipelineAttr had an empty mnemonic and could not be
     round-tripped through text. Replace it with a string attr so the
     module can be parsed by the Python API.
     """
@@ -365,6 +365,16 @@ def _make_module_parseable(module_str: str) -> str:
         r"#iree_codegen<\s*(\w+)\s*>",
         r'"\1"',
         module_str,
+    )
+
+
+def _get_constraints_ops(input_module: ir.Module):
+    return ir.get_ops_of_type(input_module, iree_codegen.ConstraintsOp)
+
+
+def _constraints_op_to_smtlib(constraints_op) -> str:
+    return iree_codegen.convert_constraints_op_to_smtlib(
+        constraints_op, emit_reset=False
     )
 
 
@@ -385,11 +395,11 @@ def extract_smtlib_from_module(
     parseable_str = _make_module_parseable(module_str)
     with context:
         input_module = ir.Module.parse(parseable_str)
-        constraints_ops = iree_codegen.get_smt_constraints_ops(input_module)
+        constraints_ops = _get_constraints_ops(input_module)
 
         results = []
         for op in constraints_ops:
-            smtlib = iree_codegen.smt_constraints_op_to_smtlib(op)
+            smtlib = _constraints_op_to_smtlib(op)
             knobs = ir.DictAttr(op.attributes["knobs"])
             results.append((smtlib, knobs))
 
@@ -425,8 +435,102 @@ def extract_knob_names(constraints_op) -> list[str]:
     return names
 
 
-# Mapping from pipeline name strings (after _make_module_parseable) to
-# DispatchLoweringPassPipeline enum values for _fix_pipeline_attr.
+def _collect_one_of_domains(attr, domains: dict[str, int]):
+    """Recursively walk an attribute tree collecting one-of knob domains."""
+    if iree_codegen.OneOfKnobAttr.isinstance(attr):
+        knob = iree_codegen.OneOfKnobAttr(attr)
+        domains[knob.name] = len(knob.options)
+    elif isinstance(attr, ir.DictAttr):
+        for i in range(len(attr)):
+            _collect_one_of_domains(attr[i].attr, domains)
+    elif isinstance(attr, ir.ArrayAttr):
+        for i in range(len(attr)):
+            _collect_one_of_domains(attr[i], domains)
+
+
+def extract_one_of_knob_domains(constraints_op) -> dict[str, int]:
+    knobs = ir.DictAttr(constraints_op.attributes["knobs"])
+    domains: dict[str, int] = {}
+    _collect_one_of_domains(knobs, domains)
+    return domains
+
+
+def _int_attr_value(attr) -> int:
+    return int(ir.IntegerAttr(attr).value)
+
+
+def _i64_attr(value: int) -> ir.IntegerAttr:
+    return ir.IntegerAttr.get(ir.IntegerType.get_signless(64), int(value))
+
+
+def _i64_array_attr(values: list[int]) -> ir.ArrayAttr:
+    return ir.ArrayAttr.get([_i64_attr(value) for value in values])
+
+
+def _materialize_knob_value(attr, values: dict[str, int]):
+    if iree_codegen.IntKnobAttr.isinstance(attr):
+        name = iree_codegen.IntKnobAttr(attr).name
+        return int(values[name])
+    if iree_codegen.OneOfKnobAttr.isinstance(attr):
+        knob = iree_codegen.OneOfKnobAttr(attr)
+        return knob.options[int(values[knob.name])]
+    if isinstance(attr, ir.ArrayAttr):
+        return [_materialize_knob_value(attr[i], values) for i in range(len(attr))]
+    if isinstance(attr, ir.DictAttr):
+        return {
+            attr[i].name: _materialize_knob_value(attr[i].attr, values)
+            for i in range(len(attr))
+        }
+    try:
+        return _int_attr_value(attr)
+    except ValueError:
+        pass
+    return attr
+
+
+def materialize_compilation_info_from_constraints(
+    constraints_op, values: dict[str, int]
+) -> iree_codegen.CompilationInfoAttr:
+    """Materialize CompilationInfoAttr from the current constraints knobs dict."""
+    knobs = ir.DictAttr(constraints_op.attributes["knobs"])
+    materialized = {
+        knobs[i].name: _materialize_knob_value(knobs[i].attr, values)
+        for i in range(len(knobs))
+    }
+
+    lowering_entries = {}
+    for key in ("workgroup", "reduction", "subgroup"):
+        if key in materialized:
+            lowering_entries[key] = _i64_array_attr(materialized[key])
+    if "subgroup_basis" in materialized:
+        counts, mapping = materialized["subgroup_basis"]
+        lowering_entries["subgroup_basis"] = ir.ArrayAttr.get(
+            [_i64_array_attr(counts), _i64_array_attr(mapping)]
+        )
+    if "mma_kind" in materialized:
+        lowering_entries["mma_kind"] = materialized["mma_kind"]
+
+    lowering_config = iree_gpu.LoweringConfigAttr.get(
+        ir.DictAttr.get(lowering_entries)
+    )
+    workgroup_size = materialized.get("workgroup_size", [1, 1, 1])
+    subgroup_size = materialized.get("subgroup_size", 0)
+    translation_info = iree_codegen.TranslationInfoAttr.get(
+        constraints_op.attributes["pipeline"],
+        None,
+        workgroup_size,
+        int(subgroup_size),
+        None,
+    )
+    return iree_codegen.CompilationInfoAttr.get(lowering_config, translation_info)
+
+
+if not hasattr(iree_codegen, "materialize_compilation_info"):
+    iree_codegen.materialize_compilation_info = materialize_compilation_info_from_constraints
+
+
+# Mapping from pipeline name strings (after _make_module_parseable) to pipeline
+# enum values for _fix_pipeline_attr.
 _PIPELINE_NAME_TO_ENUM: dict = {}
 
 
@@ -437,18 +541,20 @@ def _init_pipeline_map():
         return
     _PIPELINE_NAME_TO_ENUM = {
         "LLVMGPUVectorDistribute": iree_codegen.DispatchLoweringPassPipeline.LLVMGPUVectorDistribute,
+        "VectorDistribute": iree_codegen.DispatchLoweringPassPipeline.LLVMGPUVectorDistribute,
         "LLVMGPUTileAndFuse": iree_codegen.DispatchLoweringPassPipeline.LLVMGPUTileAndFuse,
+        "TileAndFuse": iree_codegen.DispatchLoweringPassPipeline.LLVMGPUTileAndFuse,
     }
 
 
 def _fix_pipeline_attr(constraints_op) -> bool:
     """
-    Replace StringAttr pipeline with proper DispatchLoweringPassPipelineAttr.
+    Replace StringAttr pipeline with proper pipeline attr.
 
     After _make_module_parseable replaces #iree_codegen< LLVMGPUVectorDistribute>
     with "LLVMGPUVectorDistribute", the pipeline attribute on the constraints op
     becomes a StringAttr. This function converts it back to a proper
-    DispatchLoweringPassPipelineAttr so that materialize_compilation_info works.
+    PipelineAttr so that materialize_compilation_info works.
 
     Returns True if the pipeline was fixed, False if the pipeline name is unknown.
     """
@@ -457,7 +563,7 @@ def _fix_pipeline_attr(constraints_op) -> bool:
     pipeline_str = str(pipeline_attr).strip('"')
     pipeline_enum = _PIPELINE_NAME_TO_ENUM.get(pipeline_str)
     if pipeline_enum is None:
-        # Already a proper DispatchLoweringPassPipelineAttr or unknown.
+        # Already a proper pipeline attr or unknown.
         try:
             iree_codegen.DispatchLoweringPassPipelineAttr(pipeline_attr)
             return True
@@ -734,7 +840,7 @@ def generate_compiler_contraction_solutions(
     with tuner_ctx.mlir_ctx:
         parseable_str = _make_module_parseable(output_ir)
         input_module = ir.Module.parse(parseable_str)
-        constraints_ops = iree_codegen.get_smt_constraints_ops(input_module)
+        constraints_ops = _get_constraints_ops(input_module)
 
         _VD = iree_codegen.DispatchLoweringPassPipeline.LLVMGPUVectorDistribute
 
@@ -760,25 +866,61 @@ def generate_compiler_contraction_solutions(
 
             # Extract knob names from the constraints op.
             knob_names = extract_knob_names(op)
+            one_of_domains = extract_one_of_knob_domains(op)
 
             # Get SMT-LIB from the constraints op.
-            smtlib_str = iree_codegen.smt_constraints_op_to_smtlib(op)
+            smtlib_str = _constraints_op_to_smtlib(op)
 
             # Step 4: Solve with Z3, applying tuner-side policy constraints.
             def extra_constraints(
-                solver, vars_dict, _is_vd=is_vd, _num_sg=num_subgroups
+                solver,
+                vars_dict,
+                _is_vd=is_vd,
+                _num_sg=num_subgroups,
+                _one_of_domains=one_of_domains,
             ):
+                for name, domain_size in _one_of_domains.items():
+                    solver.add(vars_dict[name] >= 0)
+                    solver.add(vars_dict[name] < domain_size)
+                for name, var in vars_dict.items():
+                    if name.startswith("wg_") or name.startswith("red_"):
+                        solver.add(var >= 1)
+                        solver.add(var <= 512)
+                if "sg_size" in vars_dict:
+                    solver.add(
+                        vars_dict["sg_size"]
+                        == gpu_target_info.subgroup_size_choices[0]
+                    )
+                for y_name in ("wg_y", "wg_size_y"):
+                    if y_name in vars_dict:
+                        solver.add(vars_dict[y_name] == 1)
+                for z_name in ("wg_z", "wg_size_z"):
+                    if z_name in vars_dict:
+                        solver.add(vars_dict[z_name] == 1)
                 if _num_sg > 0:
                     if _is_vd:
-                        solver.add(
-                            vars_dict["sg_m_cnt"] * vars_dict["sg_n_cnt"]
-                            == _num_sg
-                        )
+                        if {"sg_m_cnt", "sg_n_cnt"} <= vars_dict.keys():
+                            solver.add(vars_dict["sg_m_cnt"] >= 1)
+                            solver.add(vars_dict["sg_n_cnt"] >= 1)
+                            solver.add(vars_dict["sg_m_cnt"] <= 32)
+                            solver.add(vars_dict["sg_n_cnt"] <= 32)
+                            solver.add(
+                                vars_dict["sg_m_cnt"] * vars_dict["sg_n_cnt"]
+                                == _num_sg
+                            )
+                        for x_name in ("wg_x", "wg_size_x"):
+                            if x_name in vars_dict and "sg_size" in vars_dict:
+                                solver.add(
+                                    vars_dict[x_name]
+                                    == _num_sg * vars_dict["sg_size"]
+                                )
                     else:
-                        solver.add(
-                            vars_dict["wg_x"]
-                            == _num_sg * vars_dict["sg_size"]
-                        )
+                        for x_name in ("wg_x", "wg_size_x"):
+                            if x_name in vars_dict and "sg_size" in vars_dict:
+                                solver.add(
+                                    vars_dict[x_name]
+                                    == _num_sg * vars_dict["sg_size"]
+                                )
 
             solutions = solve_smtlib_constraints(
                 smtlib_str, knob_names, extra_constraints
@@ -853,7 +995,7 @@ def generate_compiler_attention_solutions(
     with tuner_ctx.mlir_ctx:
         parseable_str = _make_module_parseable(output_ir)
         input_module = ir.Module.parse(parseable_str)
-        constraints_ops = iree_codegen.get_smt_constraints_ops(input_module)
+        constraints_ops = _get_constraints_ops(input_module)
 
         for op in constraints_ops:
             if not _fix_pipeline_attr(op):
@@ -868,7 +1010,7 @@ def generate_compiler_attention_solutions(
 
             # Extract knob names and SMT-LIB.
             knob_names = extract_knob_names(op)
-            smtlib_str = iree_codegen.smt_constraints_op_to_smtlib(op)
+            smtlib_str = _constraints_op_to_smtlib(op)
 
             # Step 4: Solve with Z3.
             def extra_constraints(
